@@ -1,5 +1,11 @@
 // ============================================================================
-// COMPLETE FCM NOTIFICATION SERVER
+// COMPLETE FCM NOTIFICATION SERVER (FIXED + PING FOR KEEP-ALIVE)
+// ============================================================================
+// CHANGES:
+// - Disabled Firestore auto-listener to prevent duplicate notifications
+// - Clients now send notifications directly to /send-notification endpoint
+// - Server remains stateless and only processes incoming notification requests
+// - Added /ping endpoint for UptimeRobot to keep server awake for FREE
 // ============================================================================
 
 const admin = require('firebase-admin');
@@ -109,11 +115,13 @@ app.get('/', (req, res) => {
     status: 'running',
     service: 'FCM Notification Server',
     timestamp: new Date().toISOString(),
+    version: '2.0 (Fixed - No Auto-Listener + Keep-Alive)',
     endpoints: [
       'POST /send',
       'POST /send-notification', 
       'POST /send-to-user',
-      'GET /health'
+      'GET /health',
+      'GET /ping'
     ]
   });
 });
@@ -122,6 +130,20 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    firestoreConnected: true,
+    autoListenerEnabled: false
+  });
+});
+
+// ✅ KEEP-ALIVE PING ENDPOINT (for UptimeRobot to keep server awake)
+// UptimeRobot will ping this every 5 minutes to prevent Render from sleeping
+app.get('/ping', (req, res) => {
+  console.log('🔔 Ping received from UptimeRobot - Server staying awake!');
+  res.status(200).json({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+    message: 'Server is awake and running',
     uptime: process.uptime()
   });
 });
@@ -162,11 +184,12 @@ app.post('/send', async (req, res) => {
 });
 
 // ✅ ENDPOINT 2: Send by user ID (with sender details)
+// 🔥 PRIMARY ENDPOINT - This is what the Flutter app calls
 app.post('/send-notification', async (req, res) => {
   try {
     console.log('📨 /send-notification endpoint called');
     
-    const { senderId, receiverId, message, senderName, chatId } = req.body;
+    const { senderId, receiverId, message, senderName, chatId, notificationId } = req.body;
     
     if (!senderId || !receiverId || !message) {
       return res.status(400).json({ 
@@ -178,6 +201,9 @@ app.post('/send-notification', async (req, res) => {
     console.log(`👤 Sender: ${senderName || senderId}`);
     console.log(`👤 Receiver: ${receiverId}`);
     console.log(`💬 Message: ${message.substring(0, 50)}...`);
+    if (notificationId) {
+      console.log(`🆔 Notification ID: ${notificationId}`);
+    }
     
     // Get receiver's FCM token
     const receiverDoc = await db.collection('users').doc(receiverId).get();
@@ -211,9 +237,35 @@ app.post('/send-notification', async (req, res) => {
       message: message,
       chatId: chatId || '',
       timestamp: new Date().toISOString(),
+      notificationId: notificationId || '', // Include for deduplication
     };
     
     const result = await sendFCMNotification(token, title, body, data);
+    
+    if (result.success) {
+      // ✅ OPTIONAL: Save notification to history (for receipts/read status)
+      // This does NOT trigger auto-sending, just logging
+      try {
+        await db.collection('notifications').add({
+          receiverId: receiverId,
+          senderId: senderId,
+          senderName: senderName || 'Someone',
+          type: 'message',
+          title: title,
+          body: body,
+          chatId: chatId || '',
+          notificationId: notificationId || '',
+          messageContent: message,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          read: false,
+          fcmMessageId: result.messageId,
+        });
+        console.log('✅ Notification logged to Firestore for history');
+      } catch (historyError) {
+        console.warn('⚠️ Could not save notification history:', historyError.message);
+        // Don't fail the request if history saving fails
+      }
+    }
     
     res.json(result);
     
@@ -264,9 +316,21 @@ app.post('/send-to-user', async (req, res) => {
 });
 
 // ============================================================================
-// FIRESTORE LISTENER (Optional - for auto-notifications)
+// FIRESTORE LISTENER (DISABLED - To prevent duplicate notifications)
 // ============================================================================
 
+// 🔴 COMMENTED OUT: This auto-listener was causing duplicate notifications
+// 
+// Previously, when a message was sent:
+// 1. Client sent notification via /send-notification endpoint ✅
+// 2. Client also saved to notifications collection
+// 3. This listener triggered and sent a SECOND notification ❌
+//
+// Now the client ONLY calls /send-notification endpoint
+// Server does NOT auto-trigger on Firestore changes
+// This is a cleaner, stateless architecture
+
+/*
 function startFirestoreListener() {
   console.log('👂 Starting Firestore listener...');
   
@@ -305,7 +369,6 @@ async function handleNewMessage(chatId, chatData) {
       return;
     }
     
-    // Get receiver's token
     const receiverDoc = await db.collection('users').doc(receiverId).get();
     
     if (!receiverDoc.exists) {
@@ -344,6 +407,7 @@ async function handleNewMessage(chatId, chatData) {
     console.error('❌ Error in auto-notification:', error);
   }
 }
+*/
 
 // ============================================================================
 // SERVER STARTUP
@@ -353,11 +417,20 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🌐 Health: http://localhost:${PORT}/health`);
-  console.log(`📨 Send notifications to: /send or /send-notification`);
+  console.log(`🌐 URLs:`);
+  console.log(`   - Health: http://localhost:${PORT}/health`);
+  console.log(`   - Ping: http://localhost:${PORT}/ping ← Use this for UptimeRobot`);
+  console.log(`📨 Endpoints:`);
+  console.log(`   - POST /send (token-based)`);
+  console.log(`   - POST /send-notification (user ID-based) ← PRIMARY`);
+  console.log(`   - POST /send-to-user (user ID lookup)`);
+  console.log(`   - GET /health`);
+  console.log(`   - GET /ping (for UptimeRobot keep-alive)`);
+  console.log(`⚠️  Note: Firestore auto-listener is DISABLED`);
+  console.log(`✅ Server is stateless - handles requests only`);
+  console.log(`💤 To prevent Render from sleeping, use UptimeRobot to ping /ping endpoint`);
   
-  // Start Firestore listener (optional)
-  startFirestoreListener();
+  // ❌ DO NOT call startFirestoreListener() - causes duplicate notifications
 });
 
 // Graceful shutdown
