@@ -1,174 +1,116 @@
 // ============================================================================
-// SIMPLE FIXED FCM SERVER
+// FIXED /send ENDPOINT - Accepts YOUR format
 // ============================================================================
 
-const admin = require('firebase-admin');
-const express = require('express');
-const cors = require('cors');
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// ============================================================================
-// SIMPLE FIREBASE SETUP
-// ============================================================================
-
-console.log('🚀 Starting FCM Notification Server...');
-
-// Method 1: Try environment variable first
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  console.log('📝 Loading Firebase credentials from environment variable...');
+// Fixed /send endpoint
+app.post('/send', async (req, res) => {
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase initialized from environment variable');
-    console.log(`📁 Project: ${serviceAccount.project_id}`);
-  } catch (envError) {
-    console.error('❌ Error parsing environment variable:', envError.message);
-    process.exit(1);
-  }
-} 
-// Method 2: Try base64 encoded version
-else if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
-  console.log('📝 Loading Firebase credentials from Base64...');
-  try {
-    const jsonString = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString();
-    const serviceAccount = JSON.parse(jsonString);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase initialized from Base64');
-  } catch (base64Error) {
-    console.error('❌ Error parsing Base64:', base64Error.message);
-    process.exit(1);
-  }
-}
-// Method 3: Local file (for development only)
-else {
-  console.log('📝 Loading Firebase credentials from local file...');
-  try {
-    const serviceAccount = require('./serviceAccountKey.json');
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase initialized from local file');
-  } catch (fileError) {
-    console.error('❌ Error loading local file:', fileError.message);
-    console.error('💡 Set FIREBASE_SERVICE_ACCOUNT environment variable in Render');
-    process.exit(1);
-  }
-}
-
-const db = admin.firestore();
-console.log('✅ Firestore connected');
-
-// ============================================================================
-// NOTIFICATION FUNCTIONS
-// ============================================================================
-
-async function sendNotification(token, title, body, data = {}) {
-  try {
+    console.log('📨 Received notification request');
+    console.log('📦 Body:', JSON.stringify(req.body, null, 2));
+    
+    const { token, title, body, data } = req.body;
+    
+    if (!token) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'FCM token is required' 
+      });
+    }
+    
+    console.log(`📱 Sending to token: ${token.substring(0, 30)}...`);
+    console.log(`📝 Title: ${title}`);
+    console.log(`📝 Body: ${body}`);
+    console.log(`📊 Data:`, data);
+    
     const message = {
-      notification: { title, body },
-      data: { ...data, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
+      notification: {
+        title: title || 'Notification',
+        body: body || 'You have a new message',
+      },
+      data: data || {},
       token: token,
-      android: { priority: 'high' },
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          channelId: 'high_importance_channel',
+        }
+      },
     };
     
     const response = await admin.messaging().send(message);
-    console.log(`✅ Sent to ${token.substring(0, 20)}...`);
-    return { success: true, messageId: response };
+    
+    console.log('✅ Notification sent successfully');
+    
+    res.json({
+      success: true,
+      messageId: response,
+      message: 'Notification sent successfully'
+    });
+    
   } catch (error) {
-    console.error('❌ Send error:', error.message);
-    return { success: false, error: error.message };
+    console.error('❌ Error sending notification:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
   }
-}
-
-// ============================================================================
-// API ENDPOINTS
-// ============================================================================
-
-// Health check
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'running', 
-    service: 'FCM Notification Server',
-    timestamp: new Date().toISOString(),
-    endpoints: ['POST /send', 'POST /send-to-user', 'GET /health']
-  });
 });
 
-// Simple send endpoint
-app.post('/send', async (req, res) => {
+// ALSO ADD THIS COMPATIBILITY ENDPOINT:
+app.post('/send-notification', async (req, res) => {
   try {
-    const { token, title, body } = req.body;
+    const { senderId, receiverId, message } = req.body;
     
-    if (!token) {
-      return res.status(400).json({ error: 'Token is required' });
+    if (!senderId || !receiverId || !message) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'senderId, receiverId, and message are required' 
+      });
     }
     
-    const result = await sendNotification(
-      token,
-      title || 'Notification',
-      body || 'You have a new message'
-    );
+    // Get receiver's FCM token from Firestore
+    const receiverDoc = await db.collection('users').doc(receiverId).get();
     
-    res.json(result);
+    if (!receiverDoc.exists) {
+      return res.status(404).json({ error: 'Receiver not found' });
+    }
+    
+    const receiverData = receiverDoc.data();
+    const token = receiverData.fcmToken;
+    
+    if (!token) {
+      return res.status(404).json({ error: 'Receiver has no FCM token' });
+    }
+    
+    // Get sender name
+    const senderDoc = await db.collection('users').doc(senderId).get();
+    const senderName = senderDoc.exists ? 
+      (senderDoc.data().name || 'Someone') : 'Someone';
+    
+    const fcmMessage = {
+      notification: {
+        title: `New message from ${senderName}`,
+        body: message.length > 100 ? message.substring(0, 100) + '...' : message,
+      },
+      data: {
+        type: 'message',
+        senderId: senderId,
+        senderName: senderName,
+        message: message,
+        timestamp: new Date().toISOString(),
+      },
+      token: token,
+    };
+    
+    const response = await admin.messaging().send(fcmMessage);
+    
+    res.json({
+      success: true,
+      messageId: response,
+    });
+    
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
-
-// Send to user by ID
-app.post('/send-to-user', async (req, res) => {
-  try {
-    const { userId, title, body } = req.body;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
-    }
-    
-    // Get user's FCM token
-    const userDoc = await db.collection('users').doc(userId).get();
-    
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const userData = userDoc.data();
-    const token = userData.fcmToken;
-    
-    if (!token) {
-      return res.status(404).json({ error: 'User has no FCM token' });
-    }
-    
-    const result = await sendNotification(
-      token,
-      title || 'Hello!',
-      body || 'You have a notification'
-    );
-    
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Health endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-});
-
-// ============================================================================
-// START SERVER
-// ============================================================================
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🌐 Health check: https://your-app.onrender.com/health`);
-  console.log(`📨 Send notifications: POST /send`);
 });
